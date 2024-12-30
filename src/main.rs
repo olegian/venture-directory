@@ -5,17 +5,24 @@ use crossterm::cursor::{MoveDown, MoveLeft, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Print, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
-use std::cmp::max;
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs::read_dir;
 use std::io::{self, stdout, Stdout};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::thread::sleep;
-use std::time::Duration;
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x00000002;
+
+/* TODO WHEN THE THING KINDA WORKS:
+    - change all direct terminal execution to be lazy execution, flush on the end of the user loop on change?
+    - make the user input blocking until input is received, rather than constantly rerunning the loop with NOOPs
+    - Vec vs array in directory management?
+    - Magic numbers (a lot of them move into config?)
+    - Fuzzy find files from root directory
+    - Conditioanlly hide hidden files
+    - Conditionally hide non-directory files
+    - a SHITTON of code cleanup wow this is starting off as a messy repo. use files dumbass.
+*/
 
 struct Config {
     column_height: usize,
@@ -38,7 +45,6 @@ struct Directory {
     contents: Vec<Entry>,
     name: String,
 }
-struct ProcessDirError;
 
 fn init_path_stack(p: &Path) -> Vec<String> {
     let mut p_stack: Vec<String> = p
@@ -48,7 +54,7 @@ fn init_path_stack(p: &Path) -> Vec<String> {
 
     // remove windows formatting, join together windows root directory name.
     p_stack[0] = p_stack[0].split_off(4);
-    p_stack[0] = p_stack[0..2].join("");
+    p_stack.remove(1);
     p_stack.remove(1);
 
     p_stack
@@ -56,7 +62,7 @@ fn init_path_stack(p: &Path) -> Vec<String> {
 
 fn populate_display_dirs(tail_dir: &Path, config: &Config) -> VecDeque<Directory> {
     let mut dirs = VecDeque::with_capacity(config.depth);
-    let mut next_name = "";
+    let mut next_name = String::new();
     for dir in tail_dir.ancestors() {
         if dirs.len() >= config.depth {
             break;
@@ -64,19 +70,13 @@ fn populate_display_dirs(tail_dir: &Path, config: &Config) -> VecDeque<Directory
 
         let dir_entry = dir.read_dir().expect("Unable to read directory");
         let mut longest_name = OsString::from("");
-        let mut selected_idx = 0;
-        let bcd_entries = dir_entry.enumerate().map(|(i, entry)| {
+        let mut bcd_entries = dir_entry.enumerate().map(|(i, entry)| {
             let e = entry.unwrap();
             let e_name = e.file_name();
             let e_metadata = e.metadata().unwrap();
             if longest_name.len() < e_name.len() {
                 longest_name = e_name.clone();
             }
-
-            if e_name == next_name {
-                selected_idx = i;
-            }
-
             Entry {
                 is_dir: e_metadata.is_dir(),
                 is_hidden: (e_metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0, // wow this is ugly asf
@@ -84,20 +84,36 @@ fn populate_display_dirs(tail_dir: &Path, config: &Config) -> VecDeque<Directory
             }
         });
 
+        let mut contents: Vec<Entry> = bcd_entries.collect();
+        contents.sort_by(|left, right| left.is_dir.cmp(&right.is_dir));
+        for i in 0..contents.len() {
+            if contents.get(0).unwrap().is_dir {
+                break;
+            }
+            contents.rotate_left(1);
+        }
+
+        // need to find next_name idx in list
+        let mut selected_idx = 0;
+        if next_name != "" {
+            selected_idx = contents.iter().position(|e| e.name == next_name).unwrap();
+        }
+
+
+        let name = dir.file_name().unwrap_or(&OsString::from("/")).to_str().unwrap().to_string();
         let mut res = Directory {
-            contents: bcd_entries.collect(),
+            contents: contents,
             data_width: longest_name.len(),
             selected_idx: selected_idx,
-            name: dir.file_name().unwrap().to_str().unwrap().to_string(),
+            name: name,
             start_show_idx: 0,
         };
 
-        // THIS SHIT COULD BE BROKEN?
         if res.selected_idx > config.column_height {
-            res.start_show_idx = res.selected_idx;
+            res.start_show_idx = std::cmp::max(res.selected_idx - 3, 0);
         }
 
-        next_name = dir.file_name().unwrap().to_str().unwrap();
+        next_name = res.name.clone();
         dirs.push_front(res);
     }
 
@@ -105,33 +121,24 @@ fn populate_display_dirs(tail_dir: &Path, config: &Config) -> VecDeque<Directory
 }
 
 fn draw_directory(stdout: &mut Stdout, dir: &Directory, is_current: bool, config: &Config) -> (usize, usize) {
-    let mut sorted = dir.clone();
-    sorted
-        .contents
-        .sort_by(|left, right| left.is_dir.cmp(&right.is_dir));
-
-    for i in 0..sorted.contents.len() {
-        if sorted.contents.get(0).unwrap().is_dir {
-            break;
-        }
-
-        sorted.contents.rotate_left(1)
-    }
-
     let mut dy = 0;
     let pad_size = std::cmp::min(dir.data_width, config.max_entry_width);
-    let mut it = sorted.contents.iter().enumerate();
-    // this shit is broken idk why
-    // it.nth(dir.start_show_idx);
+    let mut it = dir.contents.iter().enumerate();
+    if dir.start_show_idx > 0 {
+        it.nth(dir.start_show_idx - 1);
+    }
 
     /*
     COOL ASS IDEA: create a new struct that manually implements slicing mechanics to handle shifting / moving around
     something like {startidx, endidx, currentidx}, that indexes into some structure 
-    (could be contained in the same struct, to determine what is shown, to not have to reiterate anything when redrawing)
+    (could be contained in the same struct; to determine what is shown, to not have to reiterate anything when redrawing)
+
+    OK BUT this functionality is basically captured in the start_show_idx or whatever tf you called it, just recalculate it
+    or create a macro cause fuck storing additional state. something something cache coherance something something idk
      */
 
     for (row_idx, row_entry) in it {
-        if config.column_height <= row_idx {
+        if config.column_height <= row_idx - dir.start_show_idx {
             break;
         }
 
@@ -150,9 +157,9 @@ fn draw_directory(stdout: &mut Stdout, dir: &Directory, is_current: bool, config
             (true, true, false) => "... ",
             (true, false, true) => "    ",
             (true, false, false) => "    ",
-            (false, true, true) => "...-",
+            (false, true, true) => "...>",
             (false, true, false) => "... ",
-            (false, false, true) => "----",
+            (false, false, true) => "--->",
             (false, false, false) => "    ",
         };
 
@@ -185,15 +192,80 @@ fn draw_directory(stdout: &mut Stdout, dir: &Directory, is_current: bool, config
     (pad_size + 8, dy)
 }
 
-fn draw_dir_selector(stdout: &mut Stdout, display_data: &VecDeque<Directory>, config: &Config) {
-    execute!(stdout, Clear(ClearType::All), MoveTo(10, 10)).unwrap();
+fn draw_dir_selector(stdout: &mut Stdout, display_data: &VecDeque<Directory>, config: &Config, x: u16, y: u16) {
+    execute!(stdout, MoveTo(x, y)).unwrap();
     let mut data_iterator = display_data.iter().peekable();
     while let Some(dir) = data_iterator.next() {
         let (dx, dy) = draw_directory(stdout, dir,data_iterator.peek().is_none(),  config);
         execute!(stdout, MoveUp(dy as u16), MoveRight((dx - 1) as u16)).unwrap();
     }
+}
 
-    execute!(stdout, MoveDown(20)).unwrap();
+fn draw_current_path(stdout: &mut Stdout, path_stack: &Vec<String>, x: u16, y:u16) {
+    let path = path_stack.join("/");
+    execute!(stdout, MoveTo(x, y), Print(path)).unwrap();
+}
+
+fn exit_directory(path_stack: &Vec<String>, display_data: &VecDeque<Directory>, config: &Config) {
+    // lowkey i kinda like having the entire path opened up via Directory structs, and then using another indexing thing to 
+    // figure out how much of the tail of that Vec<Directory> to actually display, just simplifies having to conditionally
+    // open a head-directory on closing the tail-directory.
+
+    // DO THAT RE-WRITE FIRST, THIS IS SOMETHING NOT WORTH SKIMPING ACTUALLY, ITLL MAKE OPEN AND FUZZY FINDING STUFF MUCH EASIER.
+    // although fuzzy finding will be based off some index, so like not really but itll still be marginally easier.
+}
+
+fn user_loop(stdout: &mut Stdout, path_stack: &Vec<String>, display_data: &VecDeque<Directory>, config: &Config) -> String {
+    loop {
+        match read().unwrap() {
+            Event::Key(KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state,
+            }) => {
+                exit_directory(path_stack, display_data, config);
+                execute!(stdout, Clear(ClearType::All)).unwrap();
+                draw_current_path(stdout, path_stack, 1, 1);
+                draw_dir_selector(stdout, display_data, config, 1, 3);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state,
+            }) => {
+                execute!(stdout, Print("LEFT")).unwrap();
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state,
+            }) => {
+                execute!(stdout, Print("LEFT")).unwrap();
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state,
+            }) => {
+                execute!(stdout, Print("LEFT")).unwrap();
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state,
+            }) => { 
+                break;
+            },
+            _ => (),
+        };
+    }
+
+    String::from("")
 }
 
 fn main() {
@@ -202,17 +274,22 @@ fn main() {
     let mut config = Config {
         column_height: 10,
         max_entry_width: 20,
-        depth: 3,
+        depth: 5,
     };
 
     let mut path_stack = init_path_stack(&invoked_dir);
     let mut display_data = populate_display_dirs(&mut invoked_dir.clone(), &config);
 
     enable_raw_mode().unwrap();
-    draw_dir_selector(&mut stdout, &display_data, &config);
+    execute!(stdout, Clear(ClearType::All)).unwrap();
 
-    // println!("{:?}", path_stack);
-    // println!("{:?}", display_data);
+    draw_current_path(&mut stdout, &path_stack, 1, 1);
+    draw_dir_selector(&mut stdout, &display_data, &config, 1, 3);
+    let final_path: String = user_loop(&mut stdout, &path_stack, &display_data, &config);
+    disable_raw_mode().unwrap();
+
+    execute!(stdout, MoveDown(20)).unwrap();
+    println!("{}", final_path);
 }
 
 // enable_raw_mode().unwrap();
