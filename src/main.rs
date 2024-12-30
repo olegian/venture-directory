@@ -1,9 +1,9 @@
 #[macro_use]
 extern crate crossterm;
 
-use crossterm::cursor::{MoveDown, MoveLeft, MoveRight, MoveTo};
+use crossterm::cursor::{MoveDown, MoveLeft, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::Print;
+use crossterm::style::{Print, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::cmp::max;
 use std::collections::VecDeque;
@@ -20,6 +20,7 @@ const FILE_ATTRIBUTE_HIDDEN: u32 = 0x00000002;
 struct Config {
     column_height: usize,
     max_entry_width: usize,
+    depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -53,17 +54,17 @@ fn init_path_stack(p: &Path) -> Vec<String> {
     p_stack
 }
 
-fn populate_display_dirs(tail_dir: &Path) -> VecDeque<Directory> {
-    let mut dirs = VecDeque::with_capacity(3);
-    let mut prev_selected_idx: usize = 0;
+fn populate_display_dirs(tail_dir: &Path, config: &Config) -> VecDeque<Directory> {
+    let mut dirs = VecDeque::with_capacity(config.depth);
+    let mut next_name = "";
     for dir in tail_dir.ancestors() {
-        if dirs.len() >= 3 {
+        if dirs.len() >= config.depth {
             break;
         }
 
         let dir_entry = dir.read_dir().expect("Unable to read directory");
         let mut longest_name = OsString::from("");
-        let mut next_selected_idx = 0;
+        let mut selected_idx = 0;
         let bcd_entries = dir_entry.enumerate().map(|(i, entry)| {
             let e = entry.unwrap();
             let e_name = e.file_name();
@@ -72,38 +73,42 @@ fn populate_display_dirs(tail_dir: &Path) -> VecDeque<Directory> {
                 longest_name = e_name.clone();
             }
 
-            if e_name == dir.file_name().unwrap() {
-                next_selected_idx = i;
+            if e_name == next_name {
+                selected_idx = i;
             }
 
             Entry {
                 is_dir: e_metadata.is_dir(),
-                is_hidden: (e_metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0,  // wow this is ugly asf
+                is_hidden: (e_metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0, // wow this is ugly asf
                 name: e_name.into_string().unwrap(),
             }
         });
 
-        let res = Directory {
+        let mut res = Directory {
             contents: bcd_entries.collect(),
             data_width: longest_name.len(),
-            selected_idx: prev_selected_idx,
+            selected_idx: selected_idx,
             name: dir.file_name().unwrap().to_str().unwrap().to_string(),
             start_show_idx: 0,
         };
 
-        prev_selected_idx = next_selected_idx;
+        // THIS SHIT COULD BE BROKEN?
+        if res.selected_idx > config.column_height {
+            res.start_show_idx = res.selected_idx;
+        }
 
+        next_name = dir.file_name().unwrap().to_str().unwrap();
         dirs.push_front(res);
     }
 
     dirs
 }
 
-fn draw_directory(stdout: &mut Stdout, offset: usize, dir: &Directory, config: &Config) -> (usize, usize) {
+fn draw_directory(stdout: &mut Stdout, dir: &Directory, is_current: bool, config: &Config) -> (usize, usize) {
     let mut sorted = dir.clone();
-    sorted.contents.sort_by(|left, right| {
-        left.is_dir.cmp(&right.is_dir)
-    });
+    sorted
+        .contents
+        .sort_by(|left, right| left.is_dir.cmp(&right.is_dir));
 
     for i in 0..sorted.contents.len() {
         if sorted.contents.get(0).unwrap().is_dir {
@@ -113,51 +118,98 @@ fn draw_directory(stdout: &mut Stdout, offset: usize, dir: &Directory, config: &
         sorted.contents.rotate_left(1)
     }
 
-
     let mut dy = 0;
     let pad_size = std::cmp::min(dir.data_width, config.max_entry_width);
-    for (row_idx, row_entry) in sorted.contents.iter().enumerate() {
-        let mut name = &row_entry.name[..];
-        let mut adtl = if row_idx == dir.selected_idx {"----"} else {"    "};
-        if config.max_entry_width < name.len() {
-            name = &name[..config.max_entry_width];
-            adtl = "... "
+    let mut it = sorted.contents.iter().enumerate();
+    // this shit is broken idk why
+    // it.nth(dir.start_show_idx);
+
+    /*
+    COOL ASS IDEA: create a new struct that manually implements slicing mechanics to handle shifting / moving around
+    something like {startidx, endidx, currentidx}, that indexes into some structure 
+    (could be contained in the same struct, to determine what is shown, to not have to reiterate anything when redrawing)
+     */
+
+    for (row_idx, row_entry) in it {
+        if config.column_height <= row_idx {
+            break;
         }
 
-        let name = if row_idx == dir.selected_idx {
-            format!("{:-<pad_size$}{}", name, adtl)
+        let name = if config.max_entry_width < row_entry.name.len() {
+            &row_entry.name[..config.max_entry_width]
         } else {
-            format!("{:<pad_size$}{}", name, adtl)
+            &row_entry.name[..]
         };
 
-        execute!(stdout, Print(format!("| {} |", name))).unwrap();
+        let adtl = match (
+            is_current,  // currently hovered
+            config.max_entry_width < row_entry.name.len(),  // needs ellipsis
+            row_idx == dir.selected_idx,  // already entered
+        ) {
+            (true, true, true) => "... ",
+            (true, true, false) => "... ",
+            (true, false, true) => "    ",
+            (true, false, false) => "    ",
+            (false, true, true) => "...-",
+            (false, true, false) => "... ",
+            (false, false, true) => "----",
+            (false, false, false) => "    ",
+        };
+
+        let formatted_name = if row_idx == dir.selected_idx {
+            if is_current {
+                format!("{:<pad_size$}{}", name, adtl).red()
+            } else {
+                format!("{:-<pad_size$}{}", name, adtl).green()
+            }
+        } else {
+            if row_entry.is_dir {
+                format!("{:<pad_size$}{}", name, adtl).cyan()
+            } else {
+                format!("{:<pad_size$}{}", name, adtl).reset()
+            }
+        };
+
+        execute!(stdout, Print(format!("| {} |", formatted_name))).unwrap();
         execute!(stdout, MoveDown(1), MoveLeft((pad_size + 8) as u16)).unwrap();
 
+        dy += 1;
+    }
+
+    while dy < config.column_height {
+        execute!(stdout, Print(format!("| {:<pad_size$}     |", ""))).unwrap();
+        execute!(stdout, MoveDown(1), MoveLeft((pad_size + 8) as u16)).unwrap();
         dy += 1;
     }
 
     (pad_size + 8, dy)
 }
 
-fn draw_screen(stdout: &mut Stdout, display_data: &VecDeque<Directory>, config: &Config) {
-    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0)).unwrap();
-    draw_directory(stdout, 0, display_data.get(0).unwrap(), config);
+fn draw_dir_selector(stdout: &mut Stdout, display_data: &VecDeque<Directory>, config: &Config) {
+    execute!(stdout, Clear(ClearType::All), MoveTo(10, 10)).unwrap();
+    let mut data_iterator = display_data.iter().peekable();
+    while let Some(dir) = data_iterator.next() {
+        let (dx, dy) = draw_directory(stdout, dir,data_iterator.peek().is_none(),  config);
+        execute!(stdout, MoveUp(dy as u16), MoveRight((dx - 1) as u16)).unwrap();
+    }
+
+    execute!(stdout, MoveDown(20)).unwrap();
 }
 
 fn main() {
     let invoked_dir = Path::new("./").canonicalize().unwrap();
-    let mut path_stack = init_path_stack(&invoked_dir);
-    let mut display_data = populate_display_dirs(&mut invoked_dir.clone());
     let mut stdout = stdout();
     let mut config = Config {
         column_height: 10,
         max_entry_width: 20,
+        depth: 3,
     };
 
+    let mut path_stack = init_path_stack(&invoked_dir);
+    let mut display_data = populate_display_dirs(&mut invoked_dir.clone(), &config);
+
     enable_raw_mode().unwrap();
-    draw_screen(&mut stdout, &display_data, &config);
-
-
+    draw_dir_selector(&mut stdout, &display_data, &config);
 
     // println!("{:?}", path_stack);
     // println!("{:?}", display_data);
