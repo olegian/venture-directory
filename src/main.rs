@@ -55,7 +55,6 @@ fn init_path_stack(p: &Path) -> Vec<String> {
     // remove windows formatting, join together windows root directory name.
     p_stack[0] = p_stack[0].split_off(4);
     p_stack.remove(1);
-    p_stack.remove(1);
 
     p_stack
 }
@@ -153,14 +152,12 @@ fn draw_directory(stdout: &mut Stdout, dir: &Directory, is_current: bool, config
             config.max_entry_width < row_entry.name.len(),  // needs ellipsis
             row_idx == dir.selected_idx,  // already entered
         ) {
-            (true, true, true) => "... ",
-            (true, true, false) => "... ",
-            (true, false, true) => "    ",
-            (true, false, false) => "    ",
-            (false, true, true) => "...>",
+            (true, true, _) => "... ",
             (false, true, false) => "... ",
-            (false, false, true) => "--->",
+            (true, false, _) => "    ",
             (false, false, false) => "    ",
+            (false, true, true) => "...>",
+            (false, false, true) => "--->",
         };
 
         let formatted_name = if row_idx == dir.selected_idx {
